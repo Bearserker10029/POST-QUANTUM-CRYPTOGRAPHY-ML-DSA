@@ -6,7 +6,14 @@ Implementación de referencia didáctica del estándar NIST FIPS 204
 (Module-Lattice-Based Digital Signature Standard, agosto 2024),
 derivado de CRYSTALS-Dilithium.
 
-Incluye los tres conjuntos de parámetros: ML-DSA-44, ML-DSA-65 y ML-DSA-87.
+Incluye los tres conjuntos de parámetros (ML-DSA-44, ML-DSA-65 y ML-DSA-87),
+la API externa con cadena de contexto (Algoritmos 1-3), la variante pre-hash
+HashML-DSA (Algoritmos 4-5, con la tabla de OIDs de la Sección 5.4), los
+modos 'hedged' y determinista, y la interfaz ExternalMu (representante del
+mensaje μ calculado fuera del módulo firmante).
+
+Validada bit a bit con los vectores oficiales ACVP del NIST; véase
+validar_acvp.py para reproducir la comprobación.
 
 ADVERTENCIA: código con fines académicos/demostrativos. No es de tiempo
 constante ni resistente a canales laterales. Para producción use una
@@ -507,11 +514,15 @@ def keygen_internal(xi, params):
     return pk, sk
 
 
-def sign_internal(sk, M_prime, rnd, params, stats=None):
+def sign_internal(sk, M_prime, rnd, params, stats=None, mu=None):
     """Algorithm 7: ML-DSA.Sign_internal(sk, M′, rnd).
 
     `stats` (opcional): lista donde se anota el número de iteraciones del
     bucle de muestreo por rechazo (para fines demostrativos).
+    `mu` (opcional): representante del mensaje ya calculado (64 B); si se
+    proporciona, se omite su cómputo — es la interfaz "ExternalMu", en la
+    que μ puede calcularse en un módulo criptográfico distinto (FIPS 204,
+    nota de la línea 6 del Algoritmo 7).
     """
     k, l, eta, tau, gamma1, gamma2, omega, lam = params
     beta = tau * eta
@@ -522,7 +533,8 @@ def sign_internal(sk, M_prime, rnd, params, stats=None):
     t0_hat = [ntt([c % Q for c in p]) for p in t0]
     A = expand_a(rho, k, l)
 
-    mu = shake256(tr + M_prime, 64)
+    if mu is None:
+        mu = shake256(tr + M_prime, 64)
     rho2 = shake256(K + rnd + mu, 64)
 
     kappa = 0
@@ -571,8 +583,13 @@ def sign_internal(sk, M_prime, rnd, params, stats=None):
         return sig_encode(c_tilde, z, h, gamma1, omega, k)
 
 
-def verify_internal(pk, M_prime, sig, params):
-    """Algorithm 8: ML-DSA.Verify_internal(pk, M′, σ)."""
+def verify_internal(pk, M_prime, sig, params, mu=None):
+    """Algorithm 8: ML-DSA.Verify_internal(pk, M′, σ).
+
+    `mu` (opcional): representante del mensaje ya calculado (64 B); si se
+    proporciona, se omite su cómputo (interfaz "ExternalMu", nota de la
+    línea 7 del Algoritmo 8).
+    """
     k, l, eta, tau, gamma1, gamma2, omega, lam = params
     beta = tau * eta
 
@@ -585,8 +602,9 @@ def verify_internal(pk, M_prime, sig, params):
 
     rho, t1 = pk_decode(pk, k)
     A = expand_a(rho, k, l)
-    tr = shake256(pk, 64)
-    mu = shake256(tr + M_prime, 64)
+    if mu is None:
+        tr = shake256(pk, 64)
+        mu = shake256(tr + M_prime, 64)
 
     c = sample_in_ball(c_tilde, tau)
     c_hat = ntt([x % Q for x in c])
@@ -635,6 +653,96 @@ def verify(pk, M, sig, ctx=b"", params_name="ML-DSA-44"):
     return verify_internal(pk, M_prime, sig, PARAMS[params_name])
 
 
+# ----------------------------------------------------------------------------
+# HashML-DSA: variante pre-hash (FIPS 204, Sección 5.4; Algoritmos 4 y 5)
+# ----------------------------------------------------------------------------
+
+# Funciones de pre-hash aprobadas: nombre -> (función, DER encoding del OID)
+_HASHLIB = {
+    "SHA2-224": lambda m: hashlib.sha224(m).digest(),
+    "SHA2-256": lambda m: hashlib.sha256(m).digest(),
+    "SHA2-384": lambda m: hashlib.sha384(m).digest(),
+    "SHA2-512": lambda m: hashlib.sha512(m).digest(),
+    "SHA2-512/224": lambda m: hashlib.new("sha512_224", m).digest(),
+    "SHA2-512/256": lambda m: hashlib.new("sha512_256", m).digest(),
+    "SHA3-224": lambda m: hashlib.sha3_224(m).digest(),
+    "SHA3-256": lambda m: hashlib.sha3_256(m).digest(),
+    "SHA3-384": lambda m: hashlib.sha3_384(m).digest(),
+    "SHA3-512": lambda m: hashlib.sha3_512(m).digest(),
+    "SHAKE-128": lambda m: hashlib.shake_128(m).digest(32),
+    "SHAKE-256": lambda m: hashlib.shake_256(m).digest(64),
+}
+
+# DER encoding (con tag y longitud) de los OID de 2.16.840.1.101.3.4.2.x
+def _der_oid(last_byte):
+    return bytes([0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                  last_byte])
+
+PH_OID = {
+    "SHA2-224": _der_oid(0x04),
+    "SHA2-256": _der_oid(0x01),   # 2.16.840.1.101.3.4.2.1 (ejemplo del FIPS)
+    "SHA2-384": _der_oid(0x02),
+    "SHA2-512": _der_oid(0x03),
+    "SHA2-512/224": _der_oid(0x05),
+    "SHA2-512/256": _der_oid(0x06),
+    "SHA3-224": _der_oid(0x07),
+    "SHA3-256": _der_oid(0x08),
+    "SHA3-384": _der_oid(0x09),
+    "SHA3-512": _der_oid(0x0A),
+    "SHAKE-128": _der_oid(0x0B),  # ejemplo del FIPS 204 (salida de 256 bits)
+    "SHAKE-256": _der_oid(0x0C),
+}
+
+
+def _format_prehash(M, ctx, ph):
+    """Construye M′ = 0x01 ‖ len(ctx) ‖ ctx ‖ OID_PH ‖ PH(M) (Sección 5.4.1)."""
+    if ph not in _HASHLIB:
+        raise ValueError(f"función de pre-hash no soportada: {ph}")
+    if len(ctx) > 255:
+        raise ValueError("ctx demasiado largo (máx. 255 bytes)")
+    return (b"\x01" + bytes([len(ctx)]) + ctx + PH_OID[ph] + _HASHLIB[ph](M))
+
+
+def hash_sign(sk, M, ctx=b"", ph="SHAKE-256", params_name="ML-DSA-44",
+              rnd=None, stats=None):
+    """Algorithm 4: HashML-DSA.Sign — firma con pre-hash (hedged o determinista)."""
+    if rnd is None:
+        rnd = os.urandom(32)
+    M_prime = _format_prehash(M, ctx, ph)
+    return sign_internal(sk, M_prime, rnd, PARAMS[params_name], stats)
+
+
+def hash_verify(pk, M, sig, ctx=b"", ph="SHAKE-256", params_name="ML-DSA-44"):
+    """Algorithm 5: HashML-DSA.Verify — verificación con pre-hash."""
+    M_prime = _format_prehash(M, ctx, ph)
+    return verify_internal(pk, M_prime, sig, PARAMS[params_name])
+
+
+# ----------------------------------------------------------------------------
+# Interfaz ExternalMu: μ calculado fuera del módulo firmante
+# (FIPS 204, notas del Algoritmo 7 línea 6 y Algoritmo 8 línea 7: el
+# representante del mensaje μ puede computarse en un módulo distinto)
+# ----------------------------------------------------------------------------
+
+def compute_mu(pk, M, ctx=b"", params_name="ML-DSA-44", ph=None):
+    """μ := H(H(pk) ‖ M′), con M′ en formato puro (0x00) o pre-hash (0x01)."""
+    tr = shake256(pk, 64)
+    M_prime = _format_prehash(M, ctx, ph) if ph else _format_message(M, ctx)
+    return shake256(tr + M_prime, 64)
+
+
+def sign_mu(sk, mu, rnd=None, params_name="ML-DSA-44", stats=None):
+    """Firma a partir de μ precalculado (la clave privada no ve el mensaje)."""
+    if rnd is None:
+        rnd = os.urandom(32)
+    return sign_internal(sk, b"", rnd, PARAMS[params_name], stats, mu=mu)
+
+
+def verify_mu(pk, mu, sig, params_name="ML-DSA-44"):
+    """Verifica una firma a partir de μ precalculado."""
+    return verify_internal(pk, b"", sig, PARAMS[params_name], mu=mu)
+
+
 # Tamaños oficiales (FIPS 204, Tabla 2) para comprobación
 SIZES = {
     "ML-DSA-44": {"pk": 1312, "sk": 2560, "sig": 2420},
@@ -651,5 +759,17 @@ if __name__ == "__main__":
         ok = verify(pk, msg, sig, params_name=name)
         s = SIZES[name]
         assert len(pk) == s["pk"] and len(sk) == s["sk"] and len(sig) == s["sig"]
+
+        # Variante pre-hash (HashML-DSA)
+        sig_ph = hash_sign(sk, msg, ph="SHA2-512", params_name=name)
+        ok_ph = hash_verify(pk, msg, sig_ph, ph="SHA2-512", params_name=name)
+
+        # Interfaz ExternalMu
+        mu = compute_mu(pk, msg, params_name=name)
+        sig_mu = sign_mu(sk, mu, params_name=name)
+        ok_mu = verify_mu(pk, mu, sig_mu, params_name=name)
+
         print(f"{name}: pk={len(pk)}B sk={len(sk)}B sig={len(sig)}B "
-              f"verificacion={'OK' if ok else 'FALLO'}")
+              f"pura={'OK' if ok else 'FALLO'} "
+              f"prehash={'OK' if ok_ph else 'FALLO'} "
+              f"externalMu={'OK' if ok_mu else 'FALLO'}")
